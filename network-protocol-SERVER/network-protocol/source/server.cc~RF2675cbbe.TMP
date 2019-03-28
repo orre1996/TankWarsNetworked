@@ -1,0 +1,809 @@
+// server.cc
+
+#include "server.h"
+#include "util.h"
+#include <iostream>
+#include <vector>
+#include <assert.h>
+#include <locale>
+
+static bool
+server_send_stream(udp_socket &sock, const ip_address &ip, byte_stream &stream)
+{
+	return sock.send_to(ip, stream);
+}
+
+static void
+challenge_reset(challenge *ch)
+{
+	ch->ip_ = ip_address();
+	ch->client_salt_ = 0;
+	ch->challenge_salt_ = 0;
+	ch->last_send_tick_ = 0;
+	ch->last_recv_tick_ = 0;
+}
+
+static challenge *
+server_find_challenge_from_combined(server &srv, const ip_address &ip,
+	uint64_t combined_salt)
+{
+	for (challenge &ch : srv.challenges_)
+	{
+		if (ch.client_salt_ == 0 && ch.challenge_salt_ == 0)
+			continue;
+
+		uint64_t challenge_salt = ch.client_salt_ ^ combined_salt;
+		uint64_t client_salt = ch.challenge_salt_ ^ combined_salt;
+		debugf("[---] %llu %llu \n", client_salt, challenge_salt);
+		debugf("[---] %llu\n", client_salt ^ challenge_salt);
+		
+		if (ch.ip_ == ip &&
+			ch.client_salt_ == client_salt &&
+			ch.challenge_salt_ == challenge_salt)
+		{
+			return &ch;
+		}
+	}
+
+	return nullptr;
+}
+
+static challenge *
+server_find_or_add_challenge(server &srv, const ip_address &ip, uint64_t client_salt)
+{
+	if (srv.challenge_count_ == SERVER_CHALLENGE_LIMIT)
+		return nullptr;
+
+	int next_free_index = -1;
+	for (int index = 0;
+		index < SERVER_CHALLENGE_LIMIT;
+		index++)
+	{
+		challenge &ch = srv.challenges_[index];
+		if (ch.ip_ == ip && ch.client_salt_ == client_salt)
+			return &ch;
+		else if (next_free_index == -1 && ch.client_salt_ == 0)
+			next_free_index = index;
+	}
+
+	if (next_free_index != -1)
+	{
+		srv.challenge_count_++;
+		srv.challenges_[next_free_index].ip_ = ip;
+		srv.challenges_[next_free_index].client_salt_ = client_salt;
+
+		return &srv.challenges_[next_free_index];
+	}
+
+	return nullptr;
+}
+
+static void
+connection_reset(connection *conn)
+{
+	conn->state_ = CONNECTION_STATE_DISCONNECTED;
+	conn->ip_ = ip_address();
+	conn->client_salt_ = 0;
+	conn->challenge_salt_ = 0;
+	conn->connect_tick_ = 0;
+	conn->last_send_tick_ = 0;
+	conn->last_recv_tick_ = 0;
+	conn->sequence_ = 0;
+
+
+
+	while (!conn->msgQueue.empty())
+   {
+		
+		message* msg = conn->msgQueue.front();
+		conn->msgQueue.pop_back();
+		delete msg;
+		
+	}
+
+   // todo: we need to clean up the message queue
+  /* while (!conn->message_queue.empty())
+   {
+      auto message = conn->message_queue.front();
+      conn->message_queue.pop();
+      delete message;
+   }*/
+}
+
+static void
+connection_set_state(connection &conn, connection_state_type_id state)
+{
+   conn.state_ = state;
+}
+
+static connection *
+server_find_connection_from_combined_salt(server &srv, const ip_address &ip, 
+                                          const uint64_t combined_salt)
+{
+   for (connection &conn : srv.connections_)
+   {
+      if (conn.state_ == CONNECTION_STATE_DISCONNECTED)
+         continue;
+
+      //uint64_t salt = conn.client_salt_ ^ combined_salt;
+      if (conn.ip_ == ip && conn.challenge_salt_ == combined_salt)
+         return &conn;
+   }
+
+   return nullptr;
+}
+
+static int 
+server_find_free_connection_index(server &srv)
+{
+   for (int index = 0;
+        index < SERVER_CONNECTION_LIMIT;
+        index++)
+   {
+      if (srv.connections_[index].state_ == CONNECTION_STATE_DISCONNECTED &&
+          srv.connections_[index].client_salt_ == 0)
+      {
+         return index;
+      }
+   }
+
+   return -1;
+}
+
+static connection *
+server_add_connection(server &srv, const ip_address &ip,
+                      uint64_t client_salt,
+                      uint64_t challenge_salt,
+                      int64_t current_tick)
+{
+   int client_index = server_find_free_connection_index(srv);
+   if (client_index == -1)
+      return nullptr;
+
+   srv.stats_.total_connections_++;
+   srv.connection_count_++;
+
+   srv.connections_[client_index].state_ = CONNECTION_STATE_CONNECTED;
+   srv.connections_[client_index].ip_ = ip;
+   srv.connections_[client_index].client_salt_ = client_salt;
+   srv.connections_[client_index].challenge_salt_ = challenge_salt;
+   srv.connections_[client_index].connect_tick_ = current_tick;
+   srv.connections_[client_index].last_recv_tick_ = current_tick;
+   srv.sendConnectionsMessageTries = 0;
+
+   return srv.connections_ + client_index;
+}
+
+static int
+server_index_of_connection(server &srv, connection *conn)
+{
+   int index = (int)(conn - srv.connections_);
+   assert(index >= 0);
+   assert(index < SERVER_CONNECTION_LIMIT);
+   return index;
+}
+
+static void 
+server_send_connection_denied(server &srv, const ip_address &ip, denied_reason_type_id reason)
+{
+   uint8_t buffer[32];
+   byte_stream stream(sizeof(buffer), buffer);
+   byte_stream_writer writer(stream);
+
+   connection_denied_packet packet = {};
+   make_connection_denied_packet(packet, reason);
+   if (serialize(packet, writer))
+      server_send_stream(srv.sock_, ip, stream);
+}
+
+static void 
+server_send_connection_challenge(server &srv, challenge *ch, const int64_t current_tick)
+{
+   if (ch->last_send_tick_ + SERVER_CONNECTION_CHALLENGE_RESEND_TICKS >= current_tick)
+      return;
+
+   uint8_t buffer[32];
+   byte_stream stream(sizeof(buffer), buffer);
+   byte_stream_writer writer(stream);
+
+   connection_challenge_packet packet = {};
+   uint8_t connections_count = srv.connection_count_;
+   make_connection_challenge_packet(packet, ch->client_salt_, ch->challenge_salt_);
+   if (serialize(packet, writer))
+   {
+      if (server_send_stream(srv.sock_, ch->ip_, stream))
+      {
+         ch->last_send_tick_ = current_tick;
+      }
+   }
+}
+
+static void
+server_send_payload(server &srv, connection *conn, const int64_t current_tick)
+{
+	if (conn->last_send_tick_ + SERVER_PAYLOAD_SEND_RATE >= current_tick)
+		return;
+
+	payload_packet packet = {};
+	{
+		// todo: here we pack messages from the connection.message_queue
+		//       into the payload, as many as we can!
+
+		// note: pseudo-code below of what this _MIGHT_ look like!
+	 //   while (!conn->msgQueue.empty())
+	 //   {
+	 //      message *msg = conn->msgQueue.front();
+		   //std::swap(conn->msgQueue.front(), conn->msgQueue.back());//Maybe this is wrong??????!??!!?
+	 //      conn->msgQueue.pop_back();
+
+	 //      // note: serialize_message should free the memory
+	 //      //       because of ownership and all that ...
+	 //      //       
+	 //      //       ... or use simple a custom allocator
+	 //      //       to not dynamically allocate anything!
+	 //      if (!serialize(msg, writer))
+	 //         break;
+	 //   }
+
+		//while (!conn->msgQueue.empty())
+		//{
+		   // message* msg = conn->msgQueue.front();
+		   // conn->msgQueue.pop_back();
+
+		   // if (!serialize(msg, writer))
+			  //  break;
+		//}
+
+
+
+	}
+
+	//byte_stream message_stream(sizeof(packet.payload_), packet.payload_);
+	//byte_stream_writer PayloadMessageWriter(message_stream);
+
+
+	
+
+	
+	
+
+	 
+	std::vector<TestPlayerObject*> Tanks = srv.gameServer->GetTanks();
+
+	for (int i = 0; i < srv.gameServer->GetTanks().size(); i++)
+	{
+		Local_Entity_State* pMessage = new Local_Entity_State();
+		make_local_entity_message(*pMessage, LOCAL_ENTITY_MESSAGE, Tanks[i]->GetTankX(),
+			Tanks[i]->GetTankY(), Tanks[i]->GetUniqueID(),TANK, ALIVE);
+		conn->msgQueue.push_back(pMessage);
+		
+	}
+
+	std::vector<IEntity*> entities = srv.gameServer->GetEntities();
+	for (int i = 0; i < srv.gameServer->GetEntities().size(); i++)
+	{
+		if (entities[i]->GetType() != "Wall")
+		{
+			Remote_Entity_State* pMessage = new Remote_Entity_State();
+
+			make_remote_entity_message(*pMessage, REMOTE_ENTITY_MESSAGE, entities[i]->getEntityType(), entities[i]->getEntityID(), entities[i]->getEntityState(), entities[i]->getXPos(),
+				entities[i]->getYPos(), entities[i]->GetRotation());
+
+			conn->msgQueue.push_back(pMessage);
+		} 
+	}
+
+
+	uint8_t iDArray[4] = { 1,2,3,4 };
+
+	uint8_t scoreArray[4] = {0,0,0,0};
+
+	for (int i = 0; i < Tanks.size(); i++)
+	{
+		scoreArray[i] = Tanks[i]->GetScore();
+	}
+
+	uint16_t roundtripTimer[4] = { 1,2,3,4 };
+	
+
+	uint64_t time = network::get_ticks();
+	srv.deltaTime = (time - srv.lastTick);
+	srv.time -= srv.deltaTime;
+	uint16_t roundTime = (uint16_t)(srv.time / 1000);
+	srv.lastTick = time;
+
+
+	game_state_message* gsMessage = new game_state_message();
+	make_game_state_message(*gsMessage, GAMESTATE_MESSAGE, RUNNING, iDArray, scoreArray, roundtripTimer, roundTime);
+	conn->msgQueue.push_back(gsMessage);
+
+	if(srv.gameServer->GetKillMessageTries() < 10)
+	{
+		kill_message* kMessage = new kill_message();
+		make_kill_message(*kMessage ,srv.gameServer->GetKillID(), srv.gameServer->GetVictimID());
+		srv.gameServer->IncreaseKillMessageTries();
+		conn->msgQueue.push_back(kMessage);
+	}
+
+
+	const uint8_t connections_count = srv.connection_count_;
+
+	if (static_cast<int>(srv.connections_index) < static_cast<int>(connections_count))
+	{
+		if (srv.sendConnectionsMessageTries < 10)
+		{
+			const auto cMessage = new Connected_Message();
+			make_connected_message(*cMessage, CONNECTED_MESSAGE, srv.connections_index);
+			conn->msgQueue.push_back(cMessage);
+			srv.sendConnectionsMessageTries++;
+		}
+		else
+		{
+			srv.connections_index++;
+		}
+	}
+
+	if (static_cast<int>(srv.connections_index) > static_cast<int>(connections_count))
+	{
+		if (srv.sendDisonnectionsMessageTries < 10)
+		{
+			const auto dcMessage = new Disconnected_Message();
+			make_disconnected_message(*dcMessage, DISCONNECTED_MESSAGE, srv.gameServer->getLatestDc());
+			conn->msgQueue.push_back(dcMessage);
+			srv.sendDisonnectionsMessageTries++;
+		}
+		else
+		{
+			srv.connections_index--;
+		}
+	}
+
+	SerializeMessage(conn, srv, current_tick);
+}
+
+void SerializeMessage(connection* p_conn, server& p_srv, const int64_t current_tick)
+{
+
+	if (p_conn->last_send_tick_ + SERVER_PAYLOAD_SEND_RATE >= current_tick)
+		return;
+	
+	payload_packet packet = {};
+
+	make_payload_packet(packet, p_conn->sequence_++, p_conn->challenge_salt_);
+
+	byte_stream message_stream(sizeof(packet.payload_), packet.payload_);
+	byte_stream_writer PayloadMessageWriter(message_stream);
+
+	while (!p_conn->msgQueue.empty())
+	{
+		message* msg = p_conn->msgQueue.back();
+		const uint8_t typeMessage = msg->typeMessage;
+		
+		if (typeMessage == CONNECTED_MESSAGE)
+		{
+			Connected_Message* cm = (Connected_Message*)(msg);
+
+			if (!serialize(*cm, PayloadMessageWriter))
+			{
+				__debugbreak();
+			}
+		}
+
+		if (typeMessage == DISCONNECTED_MESSAGE)
+		{
+			Disconnected_Message* dcm = (Disconnected_Message*)(msg);
+
+			if (!serialize(*dcm, PayloadMessageWriter))
+			{
+				__debugbreak();
+			}
+		}
+
+		if (typeMessage == GAMESTATE_MESSAGE)
+		{
+			game_state_message* gsm = (game_state_message*)(msg);
+
+			if (!serialize(*gsm, PayloadMessageWriter))
+			{
+				__debugbreak();
+			}
+		}
+
+
+		if (typeMessage == ENTITY_MESSAGE)
+		{
+			EntityMessage* em = (EntityMessage*)(msg);
+
+			if (!serialize(*em, PayloadMessageWriter))
+			{
+				__debugbreak();
+			}
+		}
+
+		if(typeMessage == LOCAL_ENTITY_MESSAGE)
+		{
+			Local_Entity_State* lm = (Local_Entity_State*)(msg);
+
+			if (!serialize(*lm, PayloadMessageWriter))
+			{
+				__debugbreak();
+			}
+		}
+
+		if (typeMessage == REMOTE_ENTITY_MESSAGE)
+		{
+			Remote_Entity_State* rm = (Remote_Entity_State*)(msg);
+
+			if (!serialize(*rm, PayloadMessageWriter))
+			{
+				__debugbreak();
+			}
+		}
+
+		if (typeMessage == KILL_MESSAGE)
+		{
+			kill_message* km = (kill_message*)(msg);
+
+			if (!serialize(*km, PayloadMessageWriter))
+			{
+				__debugbreak();
+			}
+		}
+
+		p_conn->msgQueue.pop_back();
+		delete msg;
+	}
+
+	uint8_t buffer[2048];
+
+	byte_stream stream(sizeof(buffer), buffer);
+	byte_stream_writer writer(stream);
+
+	packet.payload_size_ = message_stream.size();
+	if (serialize(packet, writer))
+	{
+		if (server_send_stream(p_srv.sock_, p_conn->ip_, stream))
+		{
+		p_conn->last_send_tick_ = current_tick;
+		}
+	}
+}
+
+
+
+static void
+server_process_connection_request(server &srv, const ip_address &ip, 
+                                  const connection_request_packet &packet,	
+                                  const int64_t current_tick)
+{
+   debugf("[nfo] processing connection request from: %s:%d", ip.as_string(), ip.port_);
+
+   if (packet.version_ != PROTOCOL_VERSION)
+   {
+      debugf("[err] denied - wrong protocol version.");
+      server_send_connection_denied(srv, ip, DENIED_REASON_WRONG_VERSION);
+      return;
+   }
+
+   if (srv.connection_count_ == SERVER_CONNECTION_LIMIT)
+   {
+      debugf("[err] denied - server full.");
+      server_send_connection_denied(srv, ip, DENIED_REASON_SERVER_FULL);
+      return;
+   }
+
+   challenge *ch = server_find_or_add_challenge(srv, ip, packet.client_salt_);
+   if (!ch)
+   {
+      debugf("[err] denied - no free challenges.");
+      server_send_connection_denied(srv, ip, DENIED_REASON_SERVER_FULL);
+      return;
+   }
+
+   if (ch->challenge_salt_ == 0) {
+	   ch->challenge_salt_ = generate_challenge();
+   }
+	   ch->last_recv_tick_ = current_tick;
+	   server_send_connection_challenge(srv, ch, current_tick);
+   
+}
+
+static void 
+server_process_challenge_response(server &srv, const ip_address &ip, 
+                                  const challenge_response_packet &packet, 
+                                  const int64_t current_tick)
+{
+   debugf("[nfo] processing challenge response from: %s:%d", ip.as_string(), ip.port_);
+
+   challenge *ch = server_find_challenge_from_combined(srv, ip, packet.combined_salt_);
+   if (!ch)
+   {
+      debugf("[err] invalid challenge response.");
+      return;
+   }
+
+   uint64_t challenge_salt = ch->client_salt_ ^ packet.combined_salt_;
+   if (ch->challenge_salt_ != challenge_salt)
+   {
+      debugf("[err] invalid challenge salt.");
+      srv.challenge_count_--;
+      challenge_reset(ch);
+      return;
+   }
+
+   connection *conn = server_add_connection(srv, ip, 
+                                            ch->client_salt_, 
+                                            ch->challenge_salt_, 
+                                            current_tick);
+   if (!conn)
+   {
+      debugf("[err] no free connections available!");
+      server_send_connection_denied(srv, ip, DENIED_REASON_SERVER_FULL);
+      return;
+   }
+  // debugf("Player with id %d", conn->)
+   srv.challenge_count_--;
+   challenge_reset(ch);
+
+   conn->last_recv_tick_ = current_tick;
+
+   int connection_index = server_index_of_connection(srv, conn);
+   // todo: propagate this to game-server
+   srv.gameServer->on_Connect(connection_index);
+}
+
+static void
+server_process_disconnect(server &srv, const ip_address &ip, 
+                          const disconnect_packet &packet, 
+                          const int64_t current_tick)
+{
+   debugf("[nfo] processing disconnect from: %s:%d", ip.as_string(), ip.port_);
+
+   connection *conn = server_find_connection_from_combined_salt(srv, ip, packet.combined_salt_);
+   if (!conn)
+   {
+      debugf("[err] connection not found.");
+      return;
+   }
+
+   srv.connection_count_--;
+   connection_reset(conn);
+
+   int connection_index = server_index_of_connection(srv, conn);
+   // todo: propagate this to game-server
+   srv.gameServer->on_Disonnect(connection_index);
+   srv.sendDisonnectionsMessageTries = 0;
+}
+
+static void
+server_process_payload(server &srv, const ip_address &ip, 
+                        payload_packet &packet, 
+                       const int64_t current_tick)
+{
+   //debugf("[nfo] processing payload from: %s:%d", ip.as_string(), ip.port_);
+
+   connection *conn = server_find_connection_from_combined_salt(srv, ip, packet.combined_salt_);
+   if (!conn)
+   {
+      debugf("[---] %llu -- %llu", packet.combined_salt_, srv.connections_[0].challenge_salt_);
+      debugf("[err] invalid connection from: %s:%d", ip.as_string(), ip.port_);
+      return;
+   }
+
+   srv.stats_.payload_count_++;
+   srv.stats_.payload_bytes_ += packet.payload_size_;
+
+   conn->last_recv_tick_ = current_tick;
+
+   // todo: queue payload packets so that we can unpack the payload
+   //       in the game-server code.
+   
+   
+   // todo: propagate this to game-server
+  // srv.gameServer->on_payload(conn->index, &packet);
+   srv.gameServer->on_payload(conn->index, &packet, srv.time);
+}
+
+float bytesToFloat(unsigned char b0, unsigned char b1, unsigned char b2, unsigned char b3)
+{
+	unsigned char byte_array[] = { b3, b2, b1, b0 };
+	float result;
+	std::copy(reinterpret_cast<const char*>(&byte_array[0]),
+		reinterpret_cast<const char*>(&byte_array[4]),
+		reinterpret_cast<char*>(&result));
+	return result;
+}
+
+static void
+server_receive_packets(server &srv, int64_t current_tick)
+{
+   ip_address client_ip;
+   uint8_t buffer[1024];
+   byte_stream stream(sizeof(buffer), buffer);
+
+   while (srv.sock_.recv_from(client_ip, stream))
+   {
+      const packet_type_id packet_type = (packet_type_id)buffer[0];
+
+      byte_stream_reader reader(stream);
+      switch (packet_type)
+      {
+         case PACKET_CONNECTION_REQUEST:
+         {
+            connection_request_packet packet = {};
+            serialize(packet, reader);
+            server_process_connection_request(srv, client_ip, packet, current_tick);
+         } break;
+         case PACKET_CHALLENGE_RESPONSE:
+         {
+            challenge_response_packet packet = {};
+            serialize(packet, reader);
+            server_process_challenge_response(srv, client_ip, packet, current_tick);
+         } break;
+         case PACKET_DISCONNECT:
+         {
+            disconnect_packet packet = {};
+            serialize(packet, reader);
+            server_process_disconnect(srv, client_ip, packet, current_tick);
+         } break;
+         case PACKET_CONNECTION_PAYLOAD:
+		 {
+
+			 payload_packet packet = {};
+			 serialize(packet, reader);
+			 server_process_payload(srv, client_ip, packet, current_tick);
+			
+         } break;
+      }
+   }
+}
+
+
+static void
+server_send_packets(server &srv, int64_t current_tick)
+{
+   for (challenge &ch : srv.challenges_)
+   {
+      if (ch.client_salt_ == 0 && ch.challenge_salt_ == 0)
+         continue;
+
+      server_send_connection_challenge(srv, &ch, current_tick);
+   }
+
+   for (connection &conn : srv.connections_)
+   {
+      if (conn.state_ == CONNECTION_STATE_DISCONNECTED)
+         continue;
+
+      if (conn.state_ == CONNECTION_STATE_CONNECTED)
+         server_send_payload(srv, &conn, current_tick);
+   }
+}
+
+static void
+server_check_timeouts(server &srv, int64_t current_tick)
+{
+   // note: check for challenge timeouts and reset challenge entry
+   for (challenge &ch : srv.challenges_)
+   {
+      if (ch.last_recv_tick_ == 0)
+         continue;
+
+      if (ch.last_recv_tick_ + SERVER_CONNECTION_TIMEOUT_LIMIT < current_tick)
+      {
+         srv.challenge_count_--;
+         debugf("[---] challenge timed out from: %s:%d", ch.ip_.as_string(), ch.ip_.port_);
+         challenge_reset(&ch);
+      }
+   }
+
+   // note: check for connection timeouts and reset connection entry
+   for (connection &conn : srv.connections_)
+   {
+      if (conn.state_ == CONNECTION_STATE_DISCONNECTED)
+         continue;
+
+      if (conn.last_recv_tick_ + SERVER_CONNECTION_TIMEOUT_LIMIT < current_tick)
+      {
+         debugf("[nfo] connection timed out from: %s:%d", 
+                conn.ip_.as_string(), 
+                conn.ip_.port_);
+
+         srv.connection_count_--;
+         connection_reset(&conn);
+
+         int connection_index = server_index_of_connection(srv, &conn);
+         // todo: game_server->on_disconnect(connection_index);
+		 srv.gameServer->on_Disonnect(connection_index);
+      }
+   }
+}
+
+static void
+server_periodic_stats(server &srv, const int64_t current_tick)
+{
+   if (srv.stats_.last_stat_tick_ + SERVER_STAT_REPORT_RATE >= current_tick)
+      return;
+
+   srv.stats_.last_stat_tick_ = current_tick;
+
+   const int64_t time = (current_tick - srv.start_tick_) / 1000;
+   int64_t hours = time / 3600;
+   int64_t minutes = (time - (hours * 3600)) / 60;
+   int64_t seconds = time % 60;
+
+   debugf("[zum] %02llu:%02llu:%02llu - cc:%d/%d ct:%llu pc:#%llu pb:%llub", 
+          hours, minutes, seconds,
+          srv.connection_count_, 
+          SERVER_CONNECTION_LIMIT,
+          srv.stats_.total_connections_,
+          srv.stats_.payload_count_,
+          srv.stats_.payload_bytes_);
+}
+
+bool server_init(server &srv, int adapter_index)
+{
+   // note: query all local adapter addresses
+   ip_address addresses[16];
+   int address_count = ip_address::local_addresses(16, addresses);
+   if (address_count == 0)
+      return false;
+
+   if (adapter_index < 0 || adapter_index >= address_count)
+   {
+      debugf("error: invalid adapter index.");
+      return false;
+   }
+
+   // note: bind to all interfaces, and all addresses
+   ip_address local = addresses[adapter_index];
+   local.port_ = PROTOCOL_DEFAULT_PORT;
+   if (!srv.sock_.open(local))
+      return false;
+
+   // server salt
+   srv.server_salt_ = generate_random_salt();
+
+   // server start tick
+   srv.start_tick_ = network::get_ticks();
+
+   // stats
+   srv.stats_.last_stat_tick_ = 0;
+   srv.stats_.payload_count_ = 0;
+   srv.stats_.payload_bytes_ = 0;
+   srv.stats_.total_connections_ = 0;
+
+   // challenges
+   srv.challenge_count_ = 0;
+   for (challenge &ch: srv.challenges_)
+      challenge_reset(&ch);
+
+   // connections
+   srv.connection_count_ = 0;
+   for (connection &conn : srv.connections_)
+      connection_reset(&conn);
+   
+   return true;
+}
+
+void server_run(server &srv)
+{
+   {
+      ip_address local;
+      srv.sock_.address_of(local);
+      debugf("[nfo] server running at: %s:%d #%llu", 
+             local.as_string(), 
+             PROTOCOL_DEFAULT_PORT,
+             srv.server_salt_);
+   }
+
+   while (true)
+   {
+      int64_t current_tick = network::get_ticks();
+      server_receive_packets(srv, current_tick);
+      server_check_timeouts(srv, current_tick);
+      server_send_packets(srv, current_tick);
+      server_periodic_stats(srv, current_tick);
+      network::sleep(5);
+   }
+}

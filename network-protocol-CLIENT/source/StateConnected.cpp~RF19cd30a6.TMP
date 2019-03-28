@@ -1,0 +1,675 @@
+#include "stdafx.h"
+#include "StateConnected.h"
+#include "ServiceLocator.h"
+#include "InputManager.h"
+#include "Tank.h"
+#include <vector>
+#include "Wall.h"
+#include "Bullet.h"
+#include "HUD.h"
+#include "GameplayMessages.h"
+#include <cmath>
+#include <algorithm> 
+#include "CollisionManager.h"
+#include "SubMenu.h"
+#include "Timer.h"
+
+StateConnected::StateConnected(ip_address& p_hostIp, ip_address& p_localIp, udp_socket& p_sock, uint64_t& p_combinedSalt, uint64_t& p_challengeSalt, bool &p_shouldQuit)
+	:
+	stream_(sizeof(buffer), buffer),
+	server_ip(p_hostIp),
+	local_ip(p_localIp),
+	sock(p_sock),
+	combinedSalt(p_combinedSalt),
+	challengeSalt(p_challengeSalt),
+	shouldQuit(p_shouldQuit)
+
+{
+	isSent = false;
+	hud = new HUD();
+	gameplayMessages = new GameplayMessages(750, 250);
+	hasDisconnected = false;
+
+	for (int i = 0; i < 4; i++)
+	{
+		Tank* tank = new Tank();
+		tanks.push_back(tank);
+	}
+}
+
+
+StateConnected::~StateConnected()
+{
+
+}
+
+void StateConnected::Enter()
+{
+
+	levelCreator = new LevelCreator("Assets/Level/Level.txt");
+	walls = levelCreator->GetWalls();
+
+	std::cout << "Entering Connected State. \n";
+	inputManager = ServiceLocator<InputManager>::GetService();
+
+
+
+	subMenu = new SubMenu(hasDisconnected);
+	stream_.reset();
+
+	buffer[512] = { 0 };
+	byte_stream stream(sizeof(buffer), buffer);
+	stream_ = stream;
+
+	for (int i = 0; i < 512; i++)
+	{
+		bufferWrapper.buffer[i] = 0;
+	}
+
+	for (auto& inputPredictionStruct : inputPredictionStructs)
+	{
+		delete inputPredictionStruct;
+		inputPredictionStruct = nullptr;
+
+	}
+	inputPredictionStructs.clear();
+	lastRoundTripTime = 0;
+	sequence = 0;
+	latestReceivedSequence = 0;
+}
+
+void StateConnected::Exit()
+{
+	stream_.reset();
+	bufferWrapper.buffer[1024] = { 0 };
+	hasDisconnected = false;
+	shouldQuit = false;
+	isSent = false;
+	delete subMenu;
+	subMenu = nullptr;
+	myID = 255;
+	uniqueID = 0;
+	lastUniqueID = 0;
+	latestReceivedSequence = 0;
+
+	
+	for (auto& bullet : bullets)
+	{
+		delete bullet;
+		bullet = nullptr;
+	}
+	
+	
+
+	delete levelCreator;
+	levelCreator = nullptr;
+}
+
+Config::BufferWrapper StateConnected::GetBuffer()
+{
+	return bufferWrapper;
+}
+
+void StateConnected::SetBuffer(Config::BufferWrapper p_buffer)
+{
+	bufferWrapper = p_buffer;
+}
+
+byte_stream StateConnected::GetByteStream()
+{
+	return stream_;
+}
+
+void StateConnected::SetByteStream(byte_stream p_stream)
+{
+	stream_ = p_stream;
+}
+
+uint64_t StateConnected::GetRandomSalt()
+{
+	return rdm_salt_;
+}
+
+void StateConnected::SetRandomSalt(uint64_t p_salt)
+{
+	rdm_salt_ = p_salt;
+}
+
+bool StateConnected::Timer1(float p_delta)
+{
+	if (connectionTimer < 100000)
+	{
+		connectionTimer += network::get_ticks();
+		lastSent = connectionTimer;
+		return false;
+	}
+	return true;
+}
+
+bool StateConnected::frequencyTimerOne(float p_delta)
+{
+
+	if (fTimerOne <= fTimerOneMax) {
+		fTimerOne += p_delta;
+		return false;
+	}
+	fTimerOne = 0.0f;
+	return true;
+}
+
+bool StateConnected::frequencyTimerTwo(float p_delta)
+{
+
+	if (fTimerTwo < fTimerTwoMax) {
+		fTimerTwo += p_delta;
+		return false;
+	}
+	fTimerTwo = 0.0f;
+	return true;
+}
+
+void StateConnected::SetServerIp(ip_address p_address)
+{
+	server_ip = p_address;
+}
+
+void StateConnected::SetChallengeSalt(uint64_t p_salt)
+{
+	challengeSalt = p_salt;
+}
+
+bool StateConnected::HasSent()
+{
+	return isSent;
+}
+
+bool StateConnected::CheckInputPredictionAccuracy(float myX, float myY, float serverX, float serverY) const
+{
+	return abs(myX - serverX) < 10.0f && abs(myY - serverY) < 10.0f;
+}
+
+void StateConnected::RecalculateCurrentPosition(local_entity_state message)
+{
+	bool hasReached = false;
+	auto previousHistory = new inputPredictionStruct();
+
+	for (auto it = inputPredictionStructs.begin(); it != inputPredictionStructs.end(); )
+	{
+		if (message.uniqueID == (*it)->uniqueID && !hasReached) {
+			hasReached = true;
+			(*it)->PosX = message.positionX * 32.0f;
+			(*it)->PosY = message.positionY * 32.0f;
+			previousHistory = *it;
+			if (*it == inputPredictionStructs.back()) {
+				tanks[myID]->SetTankPos((*it)->PosX, (*it)->PosY);
+				break;
+			}
+		}
+		else if (hasReached)
+		{
+			CalculateNewInputPredictionElement(*previousHistory, *(*it), previousHistory->deltaTime);
+			if (*it == inputPredictionStructs.back()) {
+				tanks[myID]->SetTankPos((*it)->PosX, (*it)->PosY);
+				break;
+			}
+
+			previousHistory = *it;
+		}
+		++it;
+	}
+	delete previousHistory;
+	previousHistory = nullptr;
+}
+
+void StateConnected::RemoveInputPredictionHistory(uint16_t uniqueID)
+{
+	for (auto it = inputPredictionStructs.begin(); it != inputPredictionStructs.end(); )
+	{
+		if (uniqueID != (*it)->uniqueID) {
+			delete * it;
+			it = inputPredictionStructs.erase(it);
+		}
+		else if (uniqueID == (*it)->uniqueID) {
+			delete * it;
+			it = inputPredictionStructs.erase(it);
+			break;
+		}
+		else {
+			++it;
+		}
+	}
+	inputPredictionStructs.shrink_to_fit();
+}
+
+void StateConnected::setDeltaTime(uint16_t p_value)
+{
+	deltaTime = p_value;
+}
+
+
+void StateConnected::Update(uint8_t p_delta)
+{
+
+	if (myID != 255)
+	{
+		tanks[myID]->SendInput(inputManager->GetInput(), deltaTime);
+
+		auto* predictionStruct = new inputPredictionStruct();
+		predictionStruct->deltaTime = deltaTime;
+		predictionStruct->PosX = tanks[myID]->GetTankX();
+		predictionStruct->PosY = tanks[myID]->GetTankY();
+		predictionStruct->input = inputManager->GetInput();
+		predictionStruct->uniqueID = uniqueID;
+		inputPredictionStructs.push_back(predictionStruct);
+		uniqueID++;
+
+	}
+
+	byte_stream_reader reader(stream_);
+	if (frequencyTimerTwo(p_delta))
+	{
+		isSent = sock.recv_from(local_ip, stream_);
+		payload_packet packet = {};
+
+		if (isSent)
+		{
+			if (serialize(packet, reader)) {
+
+				byte_stream payloadStream(sizeof(packet.payload_), packet.payload_);
+				byte_stream_reader payloadReader(payloadStream);
+
+				if (latestReceivedSequence <= static_cast<int>(packet.sequence_))
+				{
+					latestReceivedSequence = static_cast<int>(packet.sequence_);
+					while (packet.payload_size_ > payloadReader.cursor_ - payloadStream.base_)
+					{
+						const auto messageType = static_cast<message_type>(payloadReader.cursor_[0]);
+
+
+						if (messageType == LOCAL_ENTITY_MESSAGE)
+						{
+							auto* positionMessage = new local_entity_state();
+							if (!serialize(*positionMessage, payloadReader))
+							{
+								break;
+							}
+
+							myID = static_cast<int>(positionMessage->entityID);
+
+							const float tankX = positionMessage->positionX * 32.0f;
+							const float tankY = positionMessage->positionY * 32.0f;
+
+							const auto state = static_cast<Entity_State>(positionMessage->entityState);
+							tanks[myID]->SetState(state);
+							tanks[myID]->setMyID(myID);
+
+							for (auto& inputPredictionStruct : inputPredictionStructs)
+							{
+								
+								if (inputPredictionStruct->uniqueID == positionMessage->uniqueID) {
+
+									if (CheckInputPredictionAccuracy(inputPredictionStruct->PosX, inputPredictionStruct->PosY, tankX, tankY))
+									{
+										break;
+									}
+									RecalculateCurrentPosition(*positionMessage);
+									break;
+								}
+							}
+							RemoveInputPredictionHistory(positionMessage->uniqueID);
+
+							delete positionMessage;
+							positionMessage = nullptr;
+						}
+
+
+						if (messageType == CONNECTED_MESSAGE)
+						{
+							auto connectionMessage = new connected_message();
+							if (!serialize(*connectionMessage, payloadReader))
+							{
+								break;
+							}
+
+							tanks[connectionMessage->entityID]->SetEntityID(connectionMessage->entityID);
+							tanks[connectionMessage->entityID]->SetState(ALIVE);
+							tanks[connectionMessage->entityID]->setPositionSpawnPoint(connectionMessage->entityID);
+							gameplayMessages->AddTextMessage("Player: " + std::to_string(connectionMessage->entityID) + " has connected", 3000.0f, 50.0f);
+
+							delete connectionMessage;
+							connectionMessage = nullptr;
+						}
+						if (messageType == REMOTE_ENTITY_MESSAGE)
+						{
+							auto remoteMessage = new remote_entity_state();
+							if (!serialize(*remoteMessage, payloadReader))
+								break;
+
+							const auto entityID = static_cast<int>(remoteMessage->entityID);
+
+							const auto positionX = static_cast<float>(remoteMessage->positionX) * 32.0f;
+							const auto positionY = static_cast<float>(remoteMessage->positionY) * 32.0f;
+							const auto rotation = static_cast<float>(remoteMessage->rotation);
+
+							if (remoteMessage->entityType == TANK)
+							{
+								tanks[entityID]->SetState(static_cast<Entity_State>(remoteMessage->entityState));
+
+								if (remoteMessage->entityState == ALIVE)
+								{
+									const vec2 endPosition = { positionX, positionY };
+									tanks[entityID]->SetEndPositionLerp(endPosition);
+									tanks[entityID]->setRealTurretRotation(rotation);
+								}
+
+
+							}
+
+							if (remoteMessage->entityType == BULLET && remoteMessage->entityState == ALIVE)
+							{
+								const auto bulletX = static_cast<float>(remoteMessage->positionX) * 32.0f;
+								const auto bulletY = static_cast<float>(remoteMessage->positionY) * 32.0f;
+								const auto bulletRotation = static_cast<float>(remoteMessage->rotation);
+
+								const vec2 endPosition = { bulletX, bulletY };
+
+								bool idExists = false;
+								for (auto& bullet : bullets)
+								{
+									if (remoteMessage->entityID == bullet->GetEntityID())
+									{
+										bullet->SetEndPositionLerp(endPosition);
+										bullet->SetRotation(bulletRotation);
+										idExists = true;
+									}
+								}
+								if (!idExists)
+								{
+									auto* bullet = new Bullet(bulletX, bulletY, bulletRotation);
+									bullets.push_back(bullet);
+									bullet->SetEntityID(remoteMessage->entityID);
+								}
+							}
+
+							if (remoteMessage->entityType == BULLET && remoteMessage->entityState == DEAD)
+							{
+								for (auto& bullet : bullets)
+								{
+									if (bullet->GetEntityID() == remoteMessage->entityID)
+									{
+										delete bullet;
+										bullet = nullptr;
+									}
+								}
+								bullets.erase(std::remove(bullets.begin(), bullets.end(), nullptr), bullets.end());
+							}
+
+							delete remoteMessage;
+							remoteMessage = nullptr;
+
+						}
+						if (messageType == DISCONNECTED_MESSAGE)
+						{
+							auto* disconnectMessage = new disconnect_message();
+							if (!serialize(*disconnectMessage, payloadReader))
+							{
+								break;
+							}
+
+							const auto entityToDC = static_cast<int>(disconnectMessage->entityID);
+							gameplayMessages->AddTextMessage("Player: " + std::to_string(entityToDC) + " has disconnected", 3000.0f, 50.0f);
+							tanks[entityToDC]->SetState(DEAD);
+
+							delete disconnectMessage;
+							disconnectMessage = nullptr;
+
+						}
+						if (messageType == ROUNDTRIPTIMER_MESSAGE)
+						{
+							auto* message = new roundtriptimer_message();
+							if (!serialize(*message, payloadReader))
+							{
+								break;
+							}
+
+							lastRoundTripTime = message->TimeStamp;
+
+							delete message;
+							message = nullptr;
+
+						}
+
+						if (messageType == GAMESTATE_MESSAGE)
+						{
+							auto* gameStateMessage = new game_state_message();
+							if (!serialize(*gameStateMessage, payloadReader))
+								break;
+
+							const uint8_t gameState = gameStateMessage->gameState;
+							uint8_t ID[4] = { gameStateMessage->ID[0], gameStateMessage->ID[1], gameStateMessage->ID[2], gameStateMessage->ID[3] };
+							uint8_t score[4] = { gameStateMessage->score[0], gameStateMessage->score[1], gameStateMessage->score[2], gameStateMessage->score[3] };
+							uint16_t roundTripTime[4] = { gameStateMessage->roundTripTime[0],gameStateMessage->roundTripTime[1], gameStateMessage->roundTripTime[2], gameStateMessage->roundTripTime[3] };
+							const uint16_t time = gameStateMessage->time;
+
+
+							for(int i = 0; i < 4; i++)
+							{
+								hud->SetPlayerScore(i, static_cast<int>(score[i]));
+								hud->SetPlayerID(i, static_cast<int>(ID[i]));
+								hud->SetPlayerPing(i, static_cast<int>(roundTripTime[i]));
+							}
+
+							hud->SetTime(static_cast<int>(time));
+							hud->SetState(static_cast<int>(gameState));
+
+							delete gameStateMessage;
+							gameStateMessage = nullptr;
+
+						}
+						if (messageType == KILL_MESSAGE)
+						{
+							auto* killMessage = new kill_message();
+							if (!serialize(*killMessage, payloadReader))
+								break;
+
+							const auto victimID = static_cast<int>(killMessage->victimID);
+							const auto killerID = static_cast<int>(killMessage->killerID);
+							gameplayMessages->AddTextMessage("Player: " + std::to_string(killerID) + " has killed: " + std::to_string(victimID), 3000.0f, 50.0f);
+
+							delete killMessage;
+							killMessage = nullptr;
+						}
+
+					}
+					clientCanReceive = network::get_ticks() + clientSendRate;
+				}
+			}
+		}
+	}
+
+	stream_.reset();
+
+	payload_packet payload{};
+	byte_stream writerStream(sizeof(payload.payload_), payload.payload_);
+	writerStream.reset();
+
+	byte_stream_writer messageWriter(writerStream);
+
+	make_payload_packet(payload, sequence, challengeSalt);
+	sequence++;
+	byte_stream_writer writer(stream_);
+
+	const float newDelta = static_cast<float>(p_delta) / 1000;
+
+	if (frequencyTimerOne(newDelta))
+	{
+		if (hasDisconnected)
+		{
+			disconnect_packet dcMessage{};
+			make_disconnect_packet(dcMessage, challengeSalt);
+			{
+				sock.send_to(server_ip, stream_);
+				shouldQuit = true;
+				stream_.reset();
+			}
+		}
+		else
+		{
+
+			for (auto& inputPredictionStruct : inputPredictionStructs)
+			{
+				if (inputPredictionStruct->uniqueID <= lastUniqueID)
+				{
+					continue;
+				}
+
+				InputMessage _message = {};
+				make_input_message(_message, inputPredictionStruct->input, tanks[myID]->GetAngle(),
+					inputPredictionStruct->uniqueID, inputPredictionStruct->deltaTime);
+				lastUniqueID = inputPredictionStruct->uniqueID;
+
+				
+
+				if (!serialize(_message, messageWriter))
+				{
+					std::cout << "Could not Serialize writer in Connected State (input message) \n";
+				}
+			}
+
+
+
+			roundtriptimer_message roundTrip = {};
+			make_roundTripTimer_message(roundTrip, lastRoundTripTime);
+			if (!serialize(roundTrip, messageWriter))
+			{
+				std::cout << "Could not serialize writer in connected state (roundTripTime message)" << '\n';
+			}
+
+			payload.payload_size_ = writerStream.size();
+
+			if (serialize(payload, writer))
+			{
+				isSent = sock.send_to(server_ip, stream_);
+			}
+		}
+
+	}
+
+	stream_.reset();
+
+	for (auto& wall : walls)
+	{
+		for (auto& tank : tanks)
+		{
+			if (CollisionManager::CheckCollision(tank, wall))
+			{
+				if (tank->GetState() == ALIVE && tank->GetMyID() == myID)
+				{
+					Vec vec;
+					const vec2 WallNormal = CollisionManager::GetNormalOfRect(tank->m_collider, wall->m_collider);
+
+					const vec2 OverlapVec = CollisionManager::CalculateCollisionOverlap(tank->m_collider, wall->m_collider);
+					const vec2 collisionVector = { WallNormal.x * OverlapVec.x, WallNormal.y * OverlapVec.y };
+
+					const float xPos = tank->GetTankX() + collisionVector.x;
+					const float yPos = tank->GetTankY() + collisionVector.y;
+					tank->SetTankPos(xPos, yPos);
+				}
+			}
+		}
+	}
+
+
+	for (auto& tank : tanks)
+	{
+		tank->Update(p_delta);
+		if(tank->GetMyID() == myID)
+		{
+			tanks[myID]->setRealTurretRotation(tanks[myID]->GetAngle());
+		}
+	}
+
+	for (auto& bullet : bullets)
+	{
+		bullet->Update(p_delta);
+	}
+
+	gameplayMessages->Update(p_delta);
+	subMenu->Update(p_delta);
+}
+
+
+void StateConnected::Draw()
+{
+
+	hud->Draw();
+
+	for (auto& wall : walls)
+	{
+		wall->Draw();
+	}
+
+	for (auto& bullet : bullets)
+	{
+		bullet->Draw();
+	}
+
+	for (auto& tank : tanks)
+	{
+		tank->Draw();
+	}
+
+	gameplayMessages->Draw();
+
+	subMenu->Draw();
+
+}
+
+void StateConnected::CalculateNewInputPredictionElement(inputPredictionStruct& a, inputPredictionStruct& b, float deltaTime)
+{
+
+	vec2 movementDirection = { 0,0 };
+
+	Vec vec;
+	const uint8_t firstBit = b.input & (1 << 0);
+	const uint8_t SecondBit = b.input & (1 << 1);
+	const uint8_t ThirdBit = b.input & (1 << 2);
+	const uint8_t FourthBit = b.input & (1 << 3);
+
+	if (firstBit > 0)
+	{
+		const vec2 upVec = { 0,-1 };
+		movementDirection = { movementDirection.x + upVec.x, movementDirection.y + upVec.y };
+	}
+
+	if (SecondBit > 0)
+	{
+		const vec2 leftVec = { -1,0 };
+		movementDirection = { movementDirection.x + leftVec.x, movementDirection.y + leftVec.y };
+
+	}
+
+	if (ThirdBit)
+	{
+		const vec2 downVec = { 0,1 };
+		movementDirection = { movementDirection.x + downVec.x, movementDirection.y + downVec.y };
+
+	}
+
+	if (FourthBit > 0)
+	{
+		const vec2 rightVec = { 1,0 };
+		movementDirection = { movementDirection.x + rightVec.x, movementDirection.y + rightVec.y };
+	}
+
+	movementDirection = vec.Normalize(movementDirection);
+
+	//b.PosX = a.PosX;
+//	b.PosY = a.PosY;
+
+	const auto fDelta = static_cast<float>(deltaTime) * 0.001f;
+	b.PosX += movementDirection.x * 160 * fDelta; 
+	b.PosY += movementDirection.y * 160 * fDelta; 
+	tanks[myID]->SetTankPos(b.PosX, b.PosY);
+
+}
